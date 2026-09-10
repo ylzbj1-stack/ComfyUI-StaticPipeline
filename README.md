@@ -1,5 +1,7 @@
 # ComfyUI-StaticPipeline
 
+English | [中文说明](README_CN.md)
+
 **Static pipeline split for multi-GPU ComfyUI: place DiT blocks across GPUs once, never move weights again.**
 
 A drop-in custom node that splits a large DiT across multiple GPUs **statically** — weights are placed at load time and never move during inference. Includes hybrid residency (resident + CPU-streamed blocks) for long sequences, activation-space LoRA for quantized models, and chunked compute for long-video workloads.
@@ -41,6 +43,8 @@ Weights don't grow with video length — activations do (~linear in tokens). For
 | `long` | ≥260f | 19/21 resident + 9 CPU-streamed | **91.97 s/it**, 24 min for a 15 s clip |
 
 (2× RTX 3080 20 GB, MiniMax H3 34 GB int8, 8-step turbo. CPU-streamed blocks are lossless packed-int8 copies; overhead ~1 s/step.)
+
+![benchmark](assets/benchmark.png)
 
 ### Four levels of chunking for long sequences
 
