@@ -103,6 +103,14 @@ UNETLoader → StaticPipelineSplit(frames=<your frame count>) → ... → sample
 - >30 s segments: use segment chaining (Director-style), not longer single shots — attention k,v must stay fully resident, so VRAM grows linearly with duration and compute grows quadratically.
 - Windows + WDDM: effective ceiling ≈ 19 GiB per 20 GB card. Linux may allow more headroom (untested).
 
+## Support
+
+If this saved your quantized multi-GPU stack from segfaulting, a tip is appreciated:
+
+**USDT (TRC20):** `TXLHM7dayYa7qHzHXWSqfrDhwZfLRT69oT`
+
+<p align="left"><img src="assets/donate_qr.png" width="240" alt="USDT TRC20 donation QR"></p>
+
 ## Acknowledgments
 
 - [pollockjj/ComfyUI-MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU) — DisTorch; the dynamic approach this project replaces for quantized stacks (and whose `p2p_registry` Windows bug we patch here)

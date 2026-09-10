@@ -88,6 +88,14 @@ UNETLoader → StaticPipelineSplit(frames=实际帧数) → ... → 采样器
 - **切换帧数档位要重启实例**——放置对已加载模型是一次性的
 - 视频 VAE（7.9G）放不下会走 lowvram 流式，正常现象
 
+## 打赏
+
+如果这套方案救了你的量化多卡栈，欢迎请作者喝杯咖啡：
+
+**USDT (TRC20)：** `TXLHM7dayYa7qHzHXWSqfrDhwZfLRT69oT`
+
+<p align="left"><img src="assets/donate_qr.png" width="240" alt="USDT TRC20 打赏二维码"></p>
+
 ## 边界
 
 - >30 秒的段：用分段拼接（Director 式），不要硬拉单段时长——attention 的 k,v 必须全量驻留，显存随时长线性涨、计算量平方涨
