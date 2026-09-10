@@ -1,0 +1,15 @@
+diff --git a/comfy/weight_adapter/bypass.py b/comfy/weight_adapter/bypass.py
+index b9d5ec7d..b5bd3867 100644
+--- a/comfy/weight_adapter/bypass.py
++++ b/comfy/weight_adapter/bypass.py
+@@ -172,6 +172,10 @@ class BypassForwardHook:
+         # Default bypass: g(f(x) + h(x, f(x)))
+         base_out = self.original_forward(x, *args, **kwargs)
+         h_out = self.adapter.h(x, base_out)
++        # [local patch] in-place support: an adapter whose h() mutated base_out
++        # (returns the same object) must not be added to itself.
++        if h_out is base_out:
++            return self.adapter.g(base_out)
+         return self.adapter.g(base_out + h_out)
+ 
+     def inject(self):

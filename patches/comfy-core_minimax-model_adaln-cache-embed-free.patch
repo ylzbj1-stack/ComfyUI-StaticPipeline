@@ -1,0 +1,38 @@
+diff --git a/comfy/ldm/minimax/model.py b/comfy/ldm/minimax/model.py
+index 494350d4..4108be72 100644
+--- a/comfy/ldm/minimax/model.py
++++ b/comfy/ldm/minimax/model.py
+@@ -597,11 +597,22 @@ class MiniMaxH3Model(nn.Module):
+             else:  # ref_audio / audio
+                 h[a:b] = audio_embed[aoff:aoff + n]
+                 aoff += n
++        # [local patch] embed intermediates are dead once h is assembled; free
++        # them so long clips (360f+) keep the per-card activation floor low.
++        del all_video_rows, all_audio_rows, video_rows, audio_rows
++        del cond_video_rows, cond_audio_rows, video_embed, audio_embed, text_states
++        del img_update, audio_update
+ 
+         t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
+         if self.use_adaln_curves:
+             # adaln projections consume interpolated coordinates of the time-embedding curve
+-            table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
++            # [local patch] cache the device cast: the table is read-only, but a fresh
++            # cast_to copy per forward call accumulates ~0.5GB x calls on cuda:0
++            # (long clips OOM). One cached copy lives for the process lifetime.
++            table = getattr(self, "_adaln_table_dev", None)
++            if table is None or table.device != device:
++                self._adaln_table_dev = comfy.model_management.cast_to(self.adaln_t_table, device=device)
++                table = self._adaln_table_dev
+             pos = t_vals.clamp(0.0, 1.0) * (table.shape[0] - 1)     # t in [0,1] -> fractional grid index, out-of-range t clamps to the curve ends
+             i0 = pos.floor().long().clamp(max=table.shape[0] - 2)   # lower grid row, max-clamp keeps t=1.0 on the last interval instead of reading past the table
+             t_emb = torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
+@@ -642,5 +653,8 @@ class MiniMaxH3Model(nn.Module):
+         # The sampler integrates the flat ODE dX/dsigma_v = (X - denoised)/sigma_v.
+         # Scaling the audio velocity by d(sigma_a)/d(sigma_v) makes that ODE equal
+         # to the audio stream's true ODE on its own shifted schedule.
+-        slope_a = time_shift_slope(sigma_v, shift_v, shift_a).to(audio_out.dtype)
++        # [local patch] slope follows audio_out's device: with the static pipeline
++        # split, final_layer output lives on the last block device while sigma
++        # inputs live on the load device - .to(dtype) alone would cross devices.
++        slope_a = time_shift_slope(sigma_v, shift_v, shift_a).to(dtype=audio_out.dtype, device=audio_out.device)
+         return [-video_out.to(video_x.dtype), (-slope_a) * audio_out.to(audio_x.dtype)]

@@ -1,0 +1,26 @@
+--- p2p_registry_upstream.py	2026-09-10 22:33:04.741051800 +0800
++++ D:\ComfyUI-H3\ComfyUI_windows_portable\ComfyUI\custom_nodes\ComfyUI-MultiGPU\p2p_registry.py	2026-09-10 12:48:02.858332300 +0800
+@@ -14,9 +14,22 @@
+ 
+ 
+ def _get_libcudart():
+-    """Load libcudart.so once and cache the handle."""
++    """Load the CUDA runtime library once and cache the handle.
++
++    [local patch] Windows compatibility: libcudart.so does not exist on
++    Windows; the CUDA runtime ships as cudart64_<ver>.dll inside torch/lib.
++    Try torch's bundled DLL first, then fall back to the original POSIX name.
++    """
+     global _libcudart
+     if _libcudart is None:
++        import os
++        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
++        for name in ("cudart64_13.dll", "cudart64_12.dll", "cudart64_11.dll", "cudart.dll"):
++            path = os.path.join(torch_lib, name)
++            if os.path.exists(path):
++                _libcudart = ctypes.CDLL(path)
++                logger.info(f"[MultiGPU P2P] loaded CUDA runtime from {path}")
++                return _libcudart
+         _libcudart = ctypes.CDLL("libcudart.so")
+     return _libcudart
+ 
