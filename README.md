@@ -89,7 +89,7 @@ Insert the node after your DiT loader:
 UNETLoader → StaticPipelineSplit(frames=<your frame count>) → ... → sampler
 ```
 
-- **`frames` must be your actual frame count** — it selects the residency profile (<110 all-resident / 110–259 mid / ≥260 long)
+- **`frames` must be the length of a single sampling pass** (max segment length for multi-segment Director chains, not the chain total) — it selects the residency profile (<110 all-resident / 110–259 mid / ≥260 long). Passing a multi-segment chain total over-streams the model and multiplies the kitchen `.to()` dispatch count per step, which is the same crash-class this node exists to avoid.
 - Launch with:
   ```
   MGPU_CPU_THRESHOLD_PERCENT=999 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
