@@ -296,6 +296,27 @@ def _install_streaming_bridge(block, device):
     dev = torch.device(device)
 
     def streamed(*args, **kw):
+        # 2026-09-11 one-way transfer: weights are read-only during forward
+        # (activation-space LoRA never writes them, int8 kernels never write
+        # them), so the CPU copy is the permanent source of truth. Copy H2D,
+        # then swap the saved CPU parameter objects back by reference - no D2H
+        # copy at all. The old return hop (block.to("cpu")) was the access-
+        # violation site: its kitchen _handle_to dispatch raced aimdo's page
+        # management under WDDM, and crash probability scaled with the number
+        # of streamed blocks (4/4 chain runs died there at 20 streamed blocks).
+        # GC reclaims the GPU copies via torch's allocator only - no kitchen
+        # dispatch, no vbar touch.
+        cpu_refs = []
+        for mod in block.modules():  # recursive, includes block itself
+            for name, p in list(mod._parameters.items()):
+                if p is not None:
+                    cpu_refs.append((mod, name, p))
+            for name, b in list(mod._buffers.items()):
+                if b is not None:
+                    cpu_refs.append((mod, name, b))
+
+        torch.cuda.synchronize(PRIMARY)
+        torch.cuda.synchronize(SECONDARY)
         block.to(dev)
         try:
             if any(torch.is_tensor(a) and a.device != dev for a in args if a is not None):
@@ -303,7 +324,12 @@ def _install_streaming_bridge(block, device):
             with torch.cuda.device(dev):
                 return orig_forward(*args, **kw)
         finally:
-            block.to("cpu")
+            for mod, name, cpu_obj in cpu_refs:
+                if name in mod._parameters:
+                    mod._parameters[name] = cpu_obj
+                else:
+                    mod._buffers[name] = cpu_obj
+            torch.cuda.synchronize(dev)
 
     block.forward = streamed
     block._static_streaming_installed = True
