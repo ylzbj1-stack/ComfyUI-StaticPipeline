@@ -38,9 +38,13 @@
 
 | 档位 | 帧数 | 布局 | 实测 |
 |---|---|---|---|
-| `short` | ≤88f | 23/27 全驻留 | **10.91 s/it**，端到端 9.5 分钟 |
-| `mid` | 110–259f | 22/23 驻留 + 5 块 CPU 流式 | **17.2 s/it**，端到端 10 分钟 |
-| `long` | ≥260f | 19/21 驻留 + 9 块 CPU 流式 | **91.97 s/it**，15 秒片 24 分钟 |
+| `short` | ≤88f | 23/27 全驻留 | **10.91 s/it**，8 步，端到端 9.5 分钟 |
+| `mid` | 110–259f | 22/23 驻留 + 5 块 CPU 流式 | 124f **~27 s/it**（采样 217–222 秒） |
+| `long` | ≥260f | 19/21 驻留 + 9 块 CPU 流式 | 360f **~92 s/it**，15 秒片 24 分钟 |
+
+导演台接力链实测成本曲线（steps=8 + turbo，960×544，段 2+）：
+124f ≈ 27 s/it · 243f ≈ 62 · 277f ≈ 78 · 311f ≈ 93 · 362f ≈ 107。段 1 有一次性的
+~140–240 秒成本（Triton 编译 + LoRA 首次搬运 + 静态切分落位）。
 
 （CPU 流式块是无损的 int8 打包拷贝，开销 ~1 秒/步。）
 
@@ -83,7 +87,7 @@ git clone https://github.com/ylzbj1-stack/ComfyUI-StaticPipeline.git
 UNETLoader → StaticPipelineSplit(frames=实际帧数) → ... → 采样器
 ```
 
-- **`frames` 必须填实际帧数**——它决定驻留档位（<110 全驻留 / 110–259 mid / ≥260 long）
+- **`frames` 必须填【单次采样】的帧数**（多段接力链填单段最大帧数，不是整链总帧数）——它决定驻留档位（<110 全驻留 / 110–259 mid / ≥260 long）
 - 启动参数：`MGPU_CPU_THRESHOLD_PERCENT=999 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 - **切换帧数档位要重启实例**——放置对已加载模型是一次性的
 - 视频 VAE（7.9G）放不下会走 lowvram 流式，正常现象
@@ -98,5 +102,8 @@ UNETLoader → StaticPipelineSplit(frames=实际帧数) → ... → 采样器
 
 ## 边界
 
-- >30 秒的段：用分段拼接（Director 式），不要硬拉单段时长——attention 的 k,v 必须全量驻留，显存随时长线性涨、计算量平方涨
+- **段长天花板（实测）**：单段无 continuity pin 上限 **226f**（243f 连续 5 次探针全 OOM）；**链式接力上限 124f**（11×124f 已端到端验证）。链式一段比同长度单段多占 ~384 MiB——“单段探针通过”不等于链上能过。
+- SageAttention 会对整条 k 做一次 **513.97 MiB 的 fp32 临时拷贝**（∝ token 数 = 帧数）——长段最大的单笔 OOM 触发点，属固有成本，与 LoRA/流式块/VAE 无关。
+- 三条腾显存的路实测**全部判死**：① 卡间挪权重（流式块在自己那次 forward 期间会临时落回原卡，峰值守恒）② 音频 VAE 搬 cuda:1（aimdo 的 vbar 只登记 device 0）③ TE 搬上 GPU（CUDA context 级崩溃）。
+- VAE 尽量留在 GPU：给视频 VAE 腾出 ~3 GiB，decode 从 137 秒降到 46 秒。
 - Windows WDDM：20G 卡有效天花板 ~19 GiB；Linux 可能更宽（未测）

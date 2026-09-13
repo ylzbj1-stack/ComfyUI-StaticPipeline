@@ -39,8 +39,12 @@ Weights don't grow with video length — activations do (~linear in tokens). For
 | Profile | Frames | Layout | Measured |
 |---|---|---|---|
 | `short` | ≤88f | all-resident 23/27 | **10.91 s/it**, 8 steps, end-to-end 9.5 min |
-| `mid` | 110–259f | 22/23 resident + 5 CPU-streamed | **17.2 s/it**, end-to-end 10 min |
-| `long` | ≥260f | 19/21 resident + 9 CPU-streamed | **91.97 s/it**, 24 min for a 15 s clip |
+| `mid` | 110–259f | 22/23 resident + 5 CPU-streamed | **~27 s/it** at 124f (217–222 s sampling) |
+| `long` | ≥260f | 19/21 resident + 9 CPU-streamed | **~92 s/it** at 360f, 24 min for a 15 s clip |
+
+Measured cost curve on a directed chained run (steps=8 + turbo, 960×544, segment 2+):
+124f ≈ 27 s/it · 243f ≈ 62 · 277f ≈ 78 · 311f ≈ 93 · 362f ≈ 107. Segment 1 carries a one-off
+~140–240 s cost (Triton compile + first LoRA move + static placement).
 
 (2× RTX 3080 20 GB, MiniMax H3 34 GB int8, 8-step turbo. CPU-streamed blocks are lossless packed-int8 copies; overhead ~1 s/step.)
 
@@ -59,9 +63,11 @@ Instead of `weight_function` hooks (which dequantize every layer every step: +5 
 
 ### Bugs found & fixed along the way (highlights)
 
-- `adaln_t_table` was `cast_to`'d **every forward call** — 9 calls × 496 MB of duplicate tables alive simultaneously (4.46 GB!) on a 360-frame job. Found via gc tensor attribution; fixed with an instance-level cache.
+- **Activation-space LoRA cache thrash**: the adapter cache was single-slot; on long sequences (`x.device` flipping cuda:0 ↔ cuda:1 within one step) it missed on every call and re-copied the whole ~1 GB adapter set — a single step took **>21 minutes** (~8.8 TB moved). Fixed by bucketing the cache per `(dtype, device)` with ≥2 entries per adapter. Tell-tale signature: **PCIe device-1 TX at ~7.8 GB/s** (GPU→host flooding). Short clips never trigger it — the key never flips.
+- `adaln_t_table` was `cast_to`'d **every forward call** — 9 calls × 496 MB of duplicate tables alive simultaneously (4.46 GB!) on a 360-frame job. Fixed with an instance-level cache.
 - comfy_kitchen's cublas workspace is bound to `torch.cuda.current_device()` — kernels on cuda:1 got cuda:0's workspace → `cudaErrorIllegalAddress`. Fixed by running every block under `torch.cuda.device(its_home)`.
 - ComfyUI-MultiGPU's dlpack guard loads `libcudart.so` — **instant crash on Windows**. Patch included (loads `cudart64_13.dll` from torch/lib).
+- Streamed blocks originally did an H2D hop **and** a D2H hop per forward. The D2H hop was the access-violation site (it reads GPU pages that aimdo may have remapped). Since weights are read-only during forward, the D2H copy is now eliminated entirely — the saved CPU parameter objects are swapped back by reference (one-way transfer).
 - TE encoding leaves a fragmented dead-block pool; sampling then OOMs at 16.5 GB allocated with 3 GB "free" per the ceiling. `empty_cache()` at load completion fixes it.
 - WDDM effective VRAM ceiling is ~19.0 GiB on 20 GB cards; `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is mandatory.
 
@@ -100,7 +106,10 @@ UNETLoader → StaticPipelineSplit(frames=<your frame count>) → ... → sample
 ## Notes & limits
 
 - Requires the ComfyUI fork runtime this was developed against (DynamicVRAM/aimdo builds; tested on torch 2.10.0+cu130). Stock ComfyUI works too — the overrides simply no-op gracefully — but the target use case is packed-quantized DiTs that crash under dynamic sharding.
-- >30 s segments: use segment chaining (Director-style), not longer single shots — attention k,v must stay fully resident, so VRAM grows linearly with duration and compute grows quadratically.
+- **Measured segment ceilings** (steps=1 probes for the roof, full runs to confirm): **single shot, no continuity pin: 226 frames** (243f OOM'd 5/5 probe runs); **chained segments: 124 frames** (validated end-to-end with 11×124f). A chained segment costs ~384 MiB more than the same length as a standalone shot — "the standalone probe passed" does not imply the chain will.
+- SageAttention allocates a **513.97 MiB fp32 temporary over the full k** (∝ token count, hence ∝ frames) — the largest single OOM trigger on long segments; intrinsic, unrelated to LoRA/streaming/VAE.
+- Three ways to free VRAM that we measured and **killed**: (a) rebalancing weights across cards — streamed blocks hop back onto their home card during their own forward, so the peak is conserved; (b) moving the audio VAE to cuda:1 — aimdo's vbar is only registered on device 0; (c) moving the text encoder to GPU — CUDA-context-level crash.
+- Keep the VAEs on the GPU: giving the video VAE ~3 GiB of headroom cut decode from 137 s → 46 s.
 - Windows + WDDM: effective ceiling ≈ 19 GiB per 20 GB card. Linux may allow more headroom (untested).
 
 ## Support

@@ -49,7 +49,78 @@ PROFILES = {
     # 110-259f: activations need ~2G/card, which the all-resident split cannot
     # fit on cuda:1 (16.25 GiB weights + 2G > 19 GiB WDDM ceiling) - measured
     # OOM at 121f. Keep cuda:0 fully loaded, stream ~3 blocks from cuda:1.
-    "mid": (15.36 * (1024 ** 3), 14.0 * (1024 ** 3)),
+    # 2026-09-12: local experiment REVERTED to upstream values for a clean control.
+    # Findings while it was in place (keep for the record):
+    #   (15.8, 16.8) -> activations OOM on device 1 ("Currently allocated 18.82 GiB,
+    #                   Requested 263 MB", ceiling ~19.0 GiB/device).
+    #   (16.4, 16.8) -> sampling OK, "0 CPU-streamed blocks", 14.8 s/it vs 185 s/it
+    #                   upstream, BUT then VRAM is so full that both VAEs fail to
+    #                   load on the GPU (video VAE 4.85 GiB + audio 0.58 GiB):
+    #                   first "Input type (torch.cuda.FloatTensor) and weight type
+    #                   (torch.FloatTensor)" (0 MB loaded), and forcing them to cpu
+    #                   hits "float != c10::Half" because vae_dtype() returns fp32
+    #                   for cpu while the video VAE file is fp16.
+    #   Arithmetic: DiT 31.6 + VAEs 5.43 + activations 3.7 = 40.7 GiB vs ~38 GiB
+    #   usable -> "DiT fully resident" and "VAEs on GPU" cannot coexist. The upstream
+    #   mid budget is deliberately what leaves the VAEs room.
+    # 2026-09-12 CONTROL DONE - upstream mid + fixed env vars, 121f, 8 steps:
+    #   SUCCESS, 15.17 s/it with "5 CPU-streamed blocks"; the all-resident (16.4,16.8)
+    #   variant was 14.8 s/it, i.e. streaming costs ~2%. So the mid budget buys
+    #   nothing, costs the VAEs their headroom, and the local experiment stays
+    #   REVERTED. The old "185 s/it at mid" reading came from an instance started
+    #   WITHOUT MGPU_CPU_THRESHOLD_PERCENT=999 / PYTORCH_CUDA_ALLOC_CONF - it was an
+    #   environment bug, not a host-RAM shortage, so extra RAM is not the fix.
+    # 2026-09-12 (b): 243f/960x544 实测 OOM -> 把 ~1.3 GiB 从 cuda:0 挪到 cuda:1。
+    # 现场：SageAttention int8 量化缓冲要 514 MiB，device 0 已 allocated 18.68 GiB
+    # (= 权重 14.76 + 两个 VAE 常驻 ~0.87 + 激活 ~3.05)，device 1 却还空着 ~6 GiB。
+    # 即"装不下"是**卡间不均衡**，不是总量不够：上游 (15.36,14.0) 把 14.76 压在 0 卡、
+    # 13.84 压在 1 卡，而两块卡的激活需求几乎对称 -> 0 卡先撞顶(1 GiB 保留区)。
+    # (13.8, 14.0) 打包结果（按上游实测反解 pre≈1.56 / final≈0.04 / 每块≈0.60 GiB，
+    # 50 块）：dev0 = 20 块 + pre ≈ 13.56，dev1 = 23 块 + final ≈ 13.88（**与上游逐字相同**，
+    # 即"已知在 124f 跑通过"的那一侧完全不动），7 块走 CPU 流式（原 5）。
+    # 只把 cuda:0 减重 1.2 GiB：两块卡变成 13.56 / 13.88 —— 对称，各留 ~5 GiB 给激活。
+    # 只切这一个变量；若下次改报 device 1，再单独降 budget[1]。
+    # 速度代价按控制实验的结论（流式块几乎免费，0 块 vs 5 块只差 2%）可忽略。
+    # ⚠ 与"上游 mid 预算更快"不冲突：那条比的是 0 块流式 vs 5 块（差 2%），结论是
+    #    "别为了常驻去挤 VAE"；这里是"为了装得下把权重挪到空着的卡上"。
+    # 2026-09-12 (d): 改后第一次 243f 实跑 -> **dev0 不再爆，改成 device 1 爆**
+    # （allocated 18.37 GiB / 请求 513.97 MiB），正是上面那句预案说的情况。
+    # 三次 OOM 请求的都是同一个 513.97 MiB = SageAttention 的 int8 量化缓冲；
+    # 分块注意力里 k/v 是**整条**的（见 _install_chunked_attention 注释），所以它
+    # ∝ 序列 token 数 = 帧数，是 243f 的固有成本，与 LoRA/流式块无关（124f 从不 OOM）。
+    # 而 dev1(13.90 权重/23 块) 的激活需求 4.47 比 dev0(3.05) 大 —— per-block 缓冲
+    # 随该卡常驻块数走。故只降 budget[1] 14.0 -> 12.8：dev1 = 22 块 + final ≈ 12.61
+    # （−1.29 GiB），块数 23→22 顺带把激活需求也压低；dev0 不动（它这轮没爆）。
+    # 预期余量：−0.5 -> +1.6 GiB。代价：流式块 7 -> 8。
+    # 2026-09-13 (d) 13.8 -> 10.8 on cuda:0 ONLY = 给视频 VAE 让出 3 GiB。**已实测确认，保留。**
+    #   问题（probe_dec/probe_dec2，1 段×124f）：decode 139.4s 里视频 VAE 占 135.7s，
+    #     py-spy 91% 叶子帧 = `r.copy_(weight, non_blocking=...)`（model_management.py:1531/1535）
+    #     —— **权重 H2D 拷贝本身**，不是精度转换（cast_bias_weight 传 dtype=None）；
+    #     解码期 PCIe 只有 ~450 MB/s，视频 VAE（fp16 4.85 GiB）只驻留 867 MB
+    #     ⇒ 134.6s × 0.45 GB/s ≈ 60 GB ≈ **把整套 VAE 权重搬了约 12 遍**（每处理一个时间块重搬一次）。
+    #   修法 = 让出 3 GiB，让 VAE 基本全驻留（实测 4868/4967 MB = 98%）。
+    #   实测结果（steps=1 / steps=8 两轮）：
+    #     decode      137.2s -> 58.0s（steps=1）｜122.9s -> 45.7s（段 2，steps=8）
+    #     sample      162.6s -> 186.8s（steps=1，一次性成本）
+    #   ⚠ **真链实测（probe_c11，11 段×124f、steps=8）**：sample 219.1 -> 235.8s（**+17.0s，+7.8%**）
+    #     —— 不是 2 段探针给的 "+1%"！2 段探针**系统性低估长链代价**（长链页缓存更紧，
+    #     流式块部分要从 D 盘现读：采样期实测系统级磁盘读 68 MB/s、可用内存仅剩 4.33 GB）。
+    #     ⇒ **教训：凡是"让资源换性能"的改动，验收必须跑真实段数的链，不能拿 2 段探针下结论。**
+    #   真链净收益：段 1 585.6 -> 545.1s；段 2~11 sample +17.0 / decode −65.6 ⇒ **每段净 −48.6s**；
+    #     整片 **110.0（无预取）→ 70.2（预取/旧预算）→ 62.4 分钟（本改动）**，
+    #     且成片 md5 与改造前**逐字节相同**（a4cf18196573cc7fe41f408d4c073555）⇒ 画面零影响。
+    "mid": (10.8 * (1024 ** 3), 12.8 * (1024 ** 3)),
+    # 2026-09-13 (e) 192-259f 专用档：**两卡都让**，为长序列的激活腾地方。
+    #   来源：probe_len243（2 段×243f、steps=8、dev0=10.8）——
+    #     段 1（无 pin）PASS，峰值 cuda:0=18586 / cuda:1=19251 MiB；
+    #     段 2（+pin，序列 277f）**OOM on device 1**（allocated 17.97 GiB, 差 634 MB）。
+    #   即：dev0 那一侧已经被 (d) 修好了，剩下的缺口在 **dev1 —— 而这台机器上 dev1 从未动过**。
+    #   账面：dev1 = 权重 12.64 + 非权重 ~5.3 = 17.97；降到 ~10.6 权重 ⇒ ~16.6 GiB，余 ~2 GiB。
+    #   代价：dev1 少放 ~4 个块（流式 14 -> 18）⇒ 按真链 +8.7%/5 块 折算约 +12~19s/段；
+    #     在 243f（sample ~533s）上只占 2.5~3.5%，可接受。
+    #   ⚠ 之所以**只给 ≥192f**：124f 是主力产线，不该为偶发长段位买单（那是 +7.8% 的税）。
+    #     这是"拆档位"的中间形态 —— 等数据够了再换成连续函数 budget=f(frames)。
+    "mid_long": (10.8 * (1024 ** 3), 10.8 * (1024 ** 3)),
     # 360f+: activations need ~3.4G/card under the ~19GiB WDDM ceiling, so
     # only ~22/24 blocks stay resident; the rest live on CPU and stream
     # card-ward for the duration of their own block call (~0.2s/step total).
@@ -62,6 +133,8 @@ def _set_budgets(frames):
     global _BUDGETS
     if frames and frames >= 260:
         _BUDGETS = PROFILES["long"]
+    elif frames and frames >= 192:
+        _BUDGETS = PROFILES["mid_long"]
     elif frames and frames >= 110:
         _BUDGETS = PROFILES["mid"]
     else:
@@ -134,6 +207,21 @@ def _install_chunked_bypass_h():
 
     orig_h = lora_mod.LoRAAdapter.h
     CHUNK = 1024
+    # ------------------------------------------------------------------
+    # 2026-09-12 (c) 诊断 + 修复。
+    # 现场：243f 单段第 1 步卡 21 分钟；py-spy 25s 采样 2509 个样本，**99% 叶子帧**
+    # 落在这里的 down.to()/up.to() —— 即缓存每次调用都 miss，整套 LoRA（~1GB）
+    # 在主机/显卡之间反复重拷；nvidia-smi dmon 显示 PCIe 双向打满
+    # (rx 5.9 / tx 7.8 GB/s)，磁盘 0、硬页错误 0。
+    # 旧实现是**单槽缓存**（只留最近一次 (dtype,device)），键一翻就丢；换成
+    # **每适配器按 (dtype,device) 分桶、最多留 2 份**，并统计 miss 与"键转换"直方图，
+    # 这样下次跑完日志能直接告诉我们到底是哪个键在翻、翻得多频繁。
+    # ⚠ 显存代价：每适配器最多多留 1 份，整套 LoRA ~1GB → 最坏 +1GB；当前 VRAM 已贴顶，
+    #   若 OOM 就把 PROFILES["mid"] 的 budget 再往下压（流式块几乎免费的杠杆）。
+    # ------------------------------------------------------------------
+    _h_stats = {"calls": 0, "miss": 0}
+    _h_trans: dict = {}
+    _h_adapters: set = set()
 
     def chunked_h(self, x, base_out):
         v = self.weights
@@ -152,16 +240,35 @@ def _install_chunked_bypass_h():
         except Exception:
             return orig_h(self, x, base_out)
 
-        # Lazily cache dtype/device-matched down/up on the adapter: casting
-        # per call allocates fp32 intermediates (the fc1 delta alone is
-        # 448MB in fp32); with the cache every matmul runs in x.dtype.
-        cache = getattr(self, "_static_h_cache", None)
-        if cache is None or cache[0] != (x.dtype, x.device):
-            down_c = down.to(device=x.device, dtype=x.dtype)
-            up_c = up.to(device=x.device, dtype=x.dtype)
-            cache = ((x.dtype, x.device), down_c, up_c)
-            self._static_h_cache = cache
-        _, down_c, up_c = cache
+        _h_stats["calls"] += 1
+        key = (x.dtype, x.device)
+        store = self.__dict__.get("_static_h_cache2")
+        if store is None:
+            store = self.__dict__["_static_h_cache2"] = {}
+            _h_adapters.add(id(self))
+        hit = store.get(key)
+        if hit is None:
+            _h_stats["miss"] += 1
+            prev = self.__dict__.get("_static_h_key")
+            if prev is not None and prev != key:
+                t = "%s->%s" % (prev[0], prev[1])
+                _h_trans[t] = _h_trans.get(t, 0) + 1
+            self.__dict__["_static_h_key"] = key
+            if len(store) >= 2:
+                store.clear()
+            # Lazily cache dtype/device-matched down/up on the adapter: casting
+            # per call allocates fp32 intermediates (the fc1 delta alone is
+            # 448MB in fp32); with the cache every matmul runs in x.dtype.
+            hit = (down.to(device=x.device, dtype=x.dtype),
+                   up.to(device=x.device, dtype=x.dtype))
+            store[key] = hit
+            if _h_stats["miss"] % 200 == 1:
+                _log.info(
+                    "chunked_h 诊断: calls=%d miss=%.1f%% adapters=%d 键转换TOP4=%s",
+                    _h_stats["calls"], 100.0 * _h_stats["miss"] / max(1, _h_stats["calls"]),
+                    len(_h_adapters),
+                    sorted(_h_trans.items(), key=lambda kv: -kv[1])[:4])
+        down_c, up_c = hit
 
         rank = down.shape[0]
         scale = (alpha / rank) if alpha is not None else 1.0
@@ -346,13 +453,32 @@ def _install_streaming_bridge(block, device):
 # --------------------------------------------------------------------------
 MLP_CHUNK_ROWS = 16384  # 88f (~13k rows) stays on the unchunked fast path
 
-def _install_chunked_attention(attn, chunk=4096):
+# 2026-09-12 local experiment: the mid tier used to buy activation headroom by
+# streaming its tail blocks from host RAM. That is far more expensive than it
+# looks once host RAM is full (pagefile-speed transfers, measured 185 s/it vs
+# 6.8 s/it fully resident), so mid now keeps every weight resident and pays a
+# little extra compute instead — smaller chunks shrink the per-block transients.
+# Scoped to mid so the short fast path keeps its unchunked GEMMs.
+MID_ATTN_CHUNK = 4096       # == upstream default (see the mid-budget note above)
+MID_MLP_CHUNK_ROWS = 16384  # == upstream default
+
+
+def _mid_tier() -> bool:
+    return _BUDGETS is PROFILES["mid"]
+
+
+def _install_chunked_attention(attn, chunk=None):
     """Chunk the two position-wise projections (qkv_proj / out_proj) of an
     Attention block, writing into preallocated buffers. The rope fusion is
     per-token (in-place on the qkv buffer) and the attention core is flash
     (O(S) memory), so both stay whole; only the big matmul transients shrink
     (full-S x_qdata ~292MB -> ~21MB per chunk). Replicates
-    comfy.ldm.minimax.model.Attention.forward verbatim otherwise."""
+    comfy.ldm.minimax.model.Attention.forward verbatim otherwise.
+
+    ``chunk=None`` resolves to the mid-tier override when the active profile is
+    mid (see MID_ATTN_CHUNK)."""
+    if chunk is None:
+        chunk = MID_ATTN_CHUNK if _mid_tier() else 4096
     if getattr(attn, "_static_chunked", False):
         return
     import comfy.model_management as _mm
@@ -420,7 +546,9 @@ def _install_chunked_attention(attn, chunk=4096):
     attn._static_chunked = True
 
 
-def _install_chunked_positionwise(module, chunk=MLP_CHUNK_ROWS):
+def _install_chunked_positionwise(module, chunk=None):
+    if chunk is None:
+        chunk = MID_MLP_CHUNK_ROWS if _mid_tier() else MLP_CHUNK_ROWS
     if getattr(module, "_static_chunked", False):
         return
     orig_forward = module.forward
