@@ -129,6 +129,30 @@ PROFILES = {
 _BUDGETS = PROFILES["short"]
 
 
+# Asymmetric pairs (e.g. 20G + 48G): per-card weight budgets in bytes, set by the
+# node's primary_gb / secondary_gb inputs. None = use the profile budgets above.
+# Kept separate from _BUDGETS on purpose: _mid_tier() compares identity against
+# PROFILES["mid"] to pick the chunked kernels, and that check must keep working.
+_BUDGET_OVERRIDE = None
+
+
+def _set_budget_override(primary_gb=0.0, secondary_gb=0.0):
+    global _BUDGET_OVERRIDE
+    if primary_gb and primary_gb > 0 and secondary_gb and secondary_gb > 0:
+        _BUDGET_OVERRIDE = (primary_gb * (1024 ** 3), secondary_gb * (1024 ** 3))
+        _log.info("budget override active: cuda:0=%.2f GiB, cuda:1=%.2f GiB (asymmetric pair)",
+                  primary_gb, secondary_gb)
+    else:
+        if primary_gb or secondary_gb:
+            _log.warning("budget override needs BOTH primary_gb and secondary_gb > 0; "
+                         "ignoring (got primary=%.2f, secondary=%.2f)", primary_gb, secondary_gb)
+        _BUDGET_OVERRIDE = None
+
+
+def _effective_budgets():
+    return _BUDGET_OVERRIDE if _BUDGET_OVERRIDE is not None else _BUDGETS
+
+
 def _set_budgets(frames):
     global _BUDGETS
     if frames and frames >= 260:
@@ -598,10 +622,11 @@ def _ensure_placed(patcher):
     _log.info("DiT size: total=%.2f GiB, pre=%.2f GiB, final=%.2f GiB, %d blocks",
               total / 2**30, pre_bytes / 2**30, final_bytes / 2**30, len(sizes))
 
+    budgets = _effective_budgets()   # profile budgets, or the asymmetric-pair override
     split_at = 0
     c0 = pre_bytes
     for i, s in enumerate(sizes):
-        if c0 + s <= _BUDGETS[0]:
+        if c0 + s <= budgets[0]:
             c0 += s
             split_at = i + 1
         else:
@@ -612,7 +637,7 @@ def _ensure_placed(patcher):
     alt = 0
     for i in range(split_at, len(sizes)):
         s = sizes[i]
-        if c1 + s <= _BUDGETS[1]:
+        if c1 + s <= budgets[1]:
             c1 += s
         else:
             streamed_idx.add(i)
@@ -886,6 +911,13 @@ class StaticPipelineSplit:
         return {"required": {
             "model": ("MODEL",),
             "frames": ("INT", {"default": 0, "min": 0, "max": 4000, "step": 1}),
+        }, "optional": {
+            "primary_gb": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 160.0, "step": 0.1,
+                "tooltip": "Asymmetric GPU pairs: weight budget (GiB) for cuda:0, leaving the "
+                           "rest of that card for activations. Set BOTH this and secondary_gb, "
+                           "or leave both 0 to use the profile budgets."}),
+            "secondary_gb": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 160.0, "step": 0.1,
+                "tooltip": "Weight budget (GiB) for cuda:1 on asymmetric pairs."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -893,8 +925,9 @@ class StaticPipelineSplit:
     FUNCTION = "convert"
     CATEGORY = "multigpu/static_pipeline"
 
-    def convert(self, model, frames=0):
+    def convert(self, model, frames=0, primary_gb=0.0, secondary_gb=0.0):
         _set_budgets(frames)
+        _set_budget_override(primary_gb, secondary_gb)
         out = model.clone()
         _install_overrides(out)
         _arm(out)

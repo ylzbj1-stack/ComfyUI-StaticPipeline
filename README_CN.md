@@ -92,6 +92,7 @@ UNETLoader → StaticPipelineSplit(frames=实际帧数) → ... → 采样器
 ```
 
 - **`frames` 必须填【单次采样】的帧数**（多段接力链填单段最大帧数，不是整链总帧数）——它决定驻留档位（<110 全驻留 / 110–259 mid / ≥260 long）
+- **异构双卡（20G + 48G、3090 + 4090 等）**：设 `primary_gb` / `secondary_gb` 为两张卡各自的权重预算（经验值：显存 − 约 4G 激活余量），切分本来就是按字节预算走的，大卡自然多分块，无需其他改动；两个都留 0 则用内置档位预算（2× 20G）。**我方尚未在异构卡上实测**（只有 2× 20G）——放置逻辑不含对称假设，试过欢迎反馈。
 - 启动参数：`MGPU_CPU_THRESHOLD_PERCENT=999 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 - **切换帧数档位要重启实例**——放置对已加载模型是一次性的
 - 视频 VAE（7.9G）放不下会走 lowvram 流式，正常现象

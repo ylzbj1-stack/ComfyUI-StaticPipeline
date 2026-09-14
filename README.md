@@ -101,6 +101,7 @@ UNETLoader → StaticPipelineSplit(frames=<your frame count>) → ... → sample
 ```
 
 - **`frames` must be the length of a single sampling pass** (max segment length for multi-segment Director chains, not the chain total) — it selects the residency profile (<110 all-resident / 110–259 mid / ≥260 long). Passing a multi-segment chain total over-streams the model and multiplies the kitchen `.to()` dispatch count per step, which is the same crash-class this node exists to avoid.
+- **Asymmetric GPU pairs** (20 GB + 48 GB, 3090 + 4090, …): set `primary_gb` / `secondary_gb` to the weight budget you want on each card (rule of thumb: VRAM minus ~4 GB of activation headroom). The split is byte-budget driven, so the bigger card simply receives more blocks — no other change needed. Leave both at 0 to use the built-in profiles (2× 20 GB). **Not yet tested on an asymmetric pair on our side** (we only have 2× 20 GB) — the placement logic has no symmetry assumption, but report back if you try it.
 - Launch with:
   ```
   MGPU_CPU_THRESHOLD_PERCENT=999 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
