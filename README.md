@@ -36,15 +36,20 @@ The killer detail: `vbar_free_memory` in the aimdo ledger started returning **ne
 
 Weights don't grow with video length — activations do (~linear in tokens). For longer clips the node automatically switches profiles:
 
-| Profile | Frames | Layout | Measured |
+| Profile | Frames | Layout | Measured (segment 2+ of a chained run) |
 |---|---|---|---|
-| `short` | ≤88f | all-resident 23/27 | **10.91 s/it**, 8 steps, end-to-end 9.5 min |
-| `mid` | 110–259f | 22/23 resident + 5 CPU-streamed | **~27 s/it** at 124f (217–222 s sampling) |
-| `long` | ≥260f | 19/21 resident + 9 CPU-streamed | **~92 s/it** at 360f, 24 min for a 15 s clip |
+| `short` | ≤88f | all-resident 23/27 | 73f: **6.80 s/it** (0.093 s/it·frame, zero streamed blocks) |
+| `mid` | 110–259f | 22/23 resident + 5 CPU-streamed | 124f: **~27 s/it** · 243f: **~62 s/it** |
+| `long` | ≥260f | 19/21 resident + 9 CPU-streamed | 277f: **~78** · 311f: **~93** · 362f: **~107 s/it** |
 
 Measured cost curve on a directed chained run (steps=8 + turbo, 960×544, segment 2+):
 124f ≈ 27 s/it · 243f ≈ 62 · 277f ≈ 78 · 311f ≈ 93 · 362f ≈ 107. Segment 1 carries a one-off
 ~140–240 s cost (Triton compile + first LoRA move + static placement).
+
+Two knobs matter for long clips: **22 hot blocks stay pinned resident per card** (the rest can
+stream), and the loaded model survives across prompts (LRU model cache) — the second and later
+submissions on the same instance skip reload, Triton recompile and the first LoRA move, saving
+**~5.7 min per clip** at the same tier.
 
 (2× RTX 3080 20 GB, MiniMax H3 34 GB int8, 8-step turbo. CPU-streamed blocks are lossless packed-int8 copies; overhead ~1 s/step.)
 
@@ -106,7 +111,7 @@ UNETLoader → StaticPipelineSplit(frames=<your frame count>) → ... → sample
 ## Notes & limits
 
 - Requires the ComfyUI fork runtime this was developed against (DynamicVRAM/aimdo builds; tested on torch 2.10.0+cu130). Stock ComfyUI works too — the overrides simply no-op gracefully — but the target use case is packed-quantized DiTs that crash under dynamic sharding.
-- **Measured segment ceilings** (steps=1 probes for the roof, full runs to confirm): **single shot, no continuity pin: 226 frames** (243f OOM'd 5/5 probe runs); **chained segments: 124 frames** (validated end-to-end with 11×124f). A chained segment costs ~384 MiB more than the same length as a standalone shot — "the standalone probe passed" does not imply the chain will.
+- **Measured segment tiers** (current dev0 budget + 22 pinned blocks): chained segments passed every tier we tested — **124 / 243 / 277 / 311 / 362 frames**, validated end-to-end. Notes quoting a 226f single-shot / 124f chained ceiling came from the pre-pin dev0 budget and no longer apply. A chained segment still costs ~384 MiB more than the same length as a standalone shot — "the standalone probe passed" does not imply the chain will.
 - SageAttention allocates a **513.97 MiB fp32 temporary over the full k** (∝ token count, hence ∝ frames) — the largest single OOM trigger on long segments; intrinsic, unrelated to LoRA/streaming/VAE.
 - Three ways to free VRAM that we measured and **killed**: (a) rebalancing weights across cards — streamed blocks hop back onto their home card during their own forward, so the peak is conserved; (b) moving the audio VAE to cuda:1 — aimdo's vbar is only registered on device 0; (c) moving the text encoder to GPU — CUDA-context-level crash.
 - Keep the VAEs on the GPU: giving the video VAE ~3 GiB of headroom cut decode from 137 s → 46 s.
